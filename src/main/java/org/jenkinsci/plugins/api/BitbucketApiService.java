@@ -22,17 +22,20 @@ import com.google.gson.Gson;
 
 public class BitbucketApiService {
 
-    private static final String API_ENDPOINT = "https://api.bitbucket.org/1.0/";
+    protected String API_ENDPOINT = "https://api.bitbucket.org/1.0/";
 
-    private OAuthService service;
+    protected OAuthService service;
 
-    public BitbucketApiService(String apiKey, String apiSecret) {
-        this(apiKey, apiSecret, null);
+    public BitbucketApiService(String serverURL, String apiKey, String apiSecret) {
+        this(serverURL, apiKey, apiSecret, null);
     }
 
-    public BitbucketApiService(String apiKey, String apiSecret, String callback) {
+    public BitbucketApiService(String serverURL, String apiKey, String apiSecret, String callback) {
         super();
-        ServiceBuilder builder = new ServiceBuilder().provider(BitbucketApi.class).apiKey(apiKey).apiSecret(apiSecret);
+        if (serverURL.isEmpty() == false) {
+            API_ENDPOINT = serverURL;
+        }
+        ServiceBuilder builder = new ServiceBuilder().provider(new JiraApi(serverURL, apiSecret)).apiKey(apiKey).apiSecret(apiSecret);
         if (StringUtils.isNotBlank(callback)) {
             builder.callback(callback);
         }

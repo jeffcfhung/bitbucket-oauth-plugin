@@ -1,8 +1,10 @@
 package org.jenkinsci.plugins;
 
 import java.io.IOException;
+import java.lang.reflect.Constructor;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+
 
 import org.acegisecurity.Authentication;
 import org.acegisecurity.AuthenticationException;
@@ -13,7 +15,8 @@ import org.acegisecurity.userdetails.UserDetails;
 import org.acegisecurity.userdetails.UserDetailsService;
 import org.acegisecurity.userdetails.UsernameNotFoundException;
 import org.apache.commons.lang.StringUtils;
-import org.jenkinsci.plugins.api.BitbucketApiService;
+
+import org.jenkinsci.plugins.api.JiraApiService;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.Header;
 import org.kohsuke.stapler.HttpRedirect;
@@ -34,10 +37,16 @@ import hudson.Extension;
 import hudson.Util;
 import hudson.model.Descriptor;
 import hudson.model.User;
+import hudson.model.UserProperty;
 import hudson.security.GroupDetails;
 import hudson.security.SecurityRealm;
 import hudson.security.UserMayOrMayNotExistException;
+
 import jenkins.model.Jenkins;
+
+import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.NoExternalUse;
+
 
 public class BitbucketSecurityRealm extends SecurityRealm {
 
@@ -45,12 +54,14 @@ public class BitbucketSecurityRealm extends SecurityRealm {
     private static final String ACCESS_TOKEN_ATTRIBUTE = BitbucketSecurityRealm.class.getName() + ".access_token";
     private static final Logger LOGGER = Logger.getLogger(BitbucketSecurityRealm.class.getName());
 
+    private String serverURL;
     private String clientID;
     private String clientSecret;
 
     @DataBoundConstructor
-    public BitbucketSecurityRealm(String clientID, String clientSecret) {
+    public BitbucketSecurityRealm(String serverURL, String clientID, String clientSecret) {
         super();
+        this.serverURL = Util.fixEmptyAndTrim(serverURL);
         this.clientID = Util.fixEmptyAndTrim(clientID);
         this.clientSecret = Util.fixEmptyAndTrim(clientSecret);
     }
@@ -59,6 +70,19 @@ public class BitbucketSecurityRealm extends SecurityRealm {
         super();
         LOGGER.log(Level.FINE, "BitbucketSecurityRealm()");
     }
+
+    /**
+     * @return the serverURL
+     */
+    public String getServerURL() {
+        return serverURL;
+    }
+
+    /**
+     * @param serverURL the severURL to set
+     */
+    public void setServerURL(String serverURL) { this.serverURL = serverURL; }
+
 
     /**
      * @return the clientID
@@ -90,6 +114,17 @@ public class BitbucketSecurityRealm extends SecurityRealm {
 
     public HttpResponse doCommenceLogin(StaplerRequest request, @Header("Referer") final String referer) throws IOException {
 
+        // Test code
+        try {
+            UserDetails uds = loadUserByUsername("test");
+            LOGGER.log(Level.ALL, "User details before login " + uds);
+        }
+        catch (Exception e) {
+            LOGGER.fine("User first time login");
+        }
+
+        // End of test code
+
         request.getSession().setAttribute(REFERER_ATTRIBUTE, referer);
 
         Jenkins jenkins = Jenkins.getInstance();
@@ -102,7 +137,7 @@ public class BitbucketSecurityRealm extends SecurityRealm {
         }
         String callback = rootUrl + "/securityRealm/finishLogin";
 
-        BitbucketApiService bitbucketApiService = new BitbucketApiService(clientID, clientSecret, callback);
+        JiraApiService bitbucketApiService = new JiraApiService(serverURL, clientID, clientSecret, callback);
 
         Token requestToken = bitbucketApiService.createRquestToken();
         request.getSession().setAttribute(ACCESS_TOKEN_ATTRIBUTE, requestToken);
@@ -112,6 +147,7 @@ public class BitbucketSecurityRealm extends SecurityRealm {
 
     public HttpResponse doFinishLogin(StaplerRequest request) throws IOException {
         String code = request.getParameter("oauth_verifier");
+        LOGGER.log(Level.ALL, "code: " + code);
 
         if (StringUtils.isBlank(code)) {
             LOGGER.log(Level.SEVERE, "doFinishLogin() code = null");
@@ -120,16 +156,26 @@ public class BitbucketSecurityRealm extends SecurityRealm {
 
         Token requestToken = (Token) request.getSession().getAttribute(ACCESS_TOKEN_ATTRIBUTE);
 
-        Token accessToken = new BitbucketApiService(clientID, clientSecret).getTokenByAuthorizationCode(code, requestToken);
+        Token accessToken = new JiraApiService(serverURL, clientID, clientSecret).getTokenByAuthorizationCode(code, requestToken);
 
         if (!accessToken.isEmpty()) {
-
-            BitbucketAuthenticationToken auth = new BitbucketAuthenticationToken(accessToken, clientID, clientSecret);
+            BitbucketAuthenticationToken auth = new BitbucketAuthenticationToken(accessToken, serverURL, clientID, clientSecret);
             SecurityContextHolder.getContext().setAuthentication(auth);
+            LOGGER.log(Level.ALL, "User name:" + auth.getName() + ", authToken: " + auth);
 
             User u = User.current();
             if (u != null) {
-                u.setFullName(auth.getName());
+                u.setFullName(auth.getFullName());
+                if(isMailerPluginPresent()) {
+                    try {
+                        // legacy hack. mail support has moved out to a separate plugin
+                        Class<?> up = Jenkins.getInstance().pluginManager.uberClassLoader.loadClass("hudson.tasks.Mailer$UserProperty");
+                        Constructor<?> c = up.getDeclaredConstructor(String.class);
+                        u.addProperty((UserProperty)c.newInstance(auth.getEmail()));
+                    } catch (ReflectiveOperationException e) {
+                        throw new RuntimeException(e);
+                    }
+                }
             }
 
         } else {
@@ -164,15 +210,22 @@ public class BitbucketSecurityRealm extends SecurityRealm {
 
     @Override
     public UserDetails loadUserByUsername(String username) {
-        UserDetails result = null;
+        UserDetails result;
         Authentication token = SecurityContextHolder.getContext().getAuthentication();
         if (token == null) {
             throw new UsernameNotFoundException("BitbucketAuthenticationToken = null, no known user: " + username);
         }
-        if (!(token instanceof BitbucketAuthenticationToken)) {
+
+        LOGGER.log(Level.ALL, "LoadUserByUsername token: " + token);
+        BitbucketAuthenticationToken authToken;
+
+        if (token instanceof BitbucketAuthenticationToken) {
+            authToken = (BitbucketAuthenticationToken) token;
+        }else {
           throw new UserMayOrMayNotExistException("Unexpected authentication type: " + token);
         }
-        result = new BitbucketApiService(clientID, clientSecret).getUserByUsername(username);
+        LOGGER.log(Level.ALL, "Get access token by user name:" + authToken.getAccessToken());
+        result = new JiraApiService(serverURL, clientID, clientSecret).getUserByToken(authToken.getAccessToken());
         if (result == null) {
             throw new UsernameNotFoundException("User does not exist for login: " + username);
         }
@@ -203,6 +256,10 @@ public class BitbucketSecurityRealm extends SecurityRealm {
         public void marshal(Object source, HierarchicalStreamWriter writer, MarshallingContext context) {
 
             BitbucketSecurityRealm realm = (BitbucketSecurityRealm) source;
+
+            writer.startNode("serverURL");
+            writer.setValue(realm.getServerURL());
+            writer.endNode();
 
             writer.startNode("clientID");
             writer.setValue(realm.getClientID());
@@ -255,7 +312,9 @@ public class BitbucketSecurityRealm extends SecurityRealm {
 
         private void setValue(BitbucketSecurityRealm realm, String node, String value) {
 
-            if (node.equalsIgnoreCase("clientid")) {
+            if (node.equalsIgnoreCase("serverURL")) {
+                realm.setServerURL(value);
+            } else if (node.equalsIgnoreCase("clientid")) {
                 realm.setClientID(value);
             } else if (node.equalsIgnoreCase("clientsecret")) {
                 realm.setClientSecret(value);
@@ -264,6 +323,17 @@ public class BitbucketSecurityRealm extends SecurityRealm {
             }
 
         }
+    }
+
+    @Restricted(NoExternalUse.class)
+    public boolean isMailerPluginPresent() {
+        try {
+            // mail support has moved to a separate plugin
+            return null != Jenkins.getInstance().pluginManager.uberClassLoader.loadClass("hudson.tasks.Mailer$UserProperty");
+        } catch (ClassNotFoundException e) {
+            LOGGER.finer("Mailer plugin not present");
+        }
+        return false;
     }
 
     @Extension
